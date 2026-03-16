@@ -1,0 +1,12 @@
+*.pth
+*.onnx
+*.bin
+*.pb
+*.h5
+*.weights
+*.ckpt
+models/
+__pycache__/
+*.log
+ckpts/
+results/
