@@ -23,6 +23,7 @@ import torch.distributed as dist
 import numpy as np
 from dataclasses import dataclass
 from packaging import version
+import os
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.configuration_utils import FrozenDict
@@ -699,6 +700,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         enable_tiling: bool = False,
         n_tokens: Optional[int] = None,
         embedded_guidance_scale: Optional[float] = None,
+        # 新增代码
+        capture_step: Optional[int] = None,
+        capture_save_path: Optional[str] = None,
+        stop_after_capture: bool = False,
+        
         **kwargs,
     ):
         r"""
@@ -961,6 +967,40 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                # 新增逻辑：只在指定 step 抓取当前 latents
+                if capture_step is not None and i == capture_step:
+                    captured_latents = latents.detach().clone().cpu()
+                    captured_t = t.detach().clone().cpu() if torch.is_tensor(t) else t
+                
+                    if capture_save_path is not None:
+                        save_dir = os.path.dirname(capture_save_path)
+                        if save_dir:
+                            os.makedirs(save_dir, exist_ok=True)
+                
+                        torch.save(
+                            {
+                                "latents": captured_latents,
+                                "timestep": captured_t,
+                                "step_index": i,
+                                "height": height,
+                                "width": width,
+                                "video_length": video_length,
+                                "vae_ver": vae_ver,
+                            },
+                            capture_save_path,
+                        )
+                        logger.info(f"Saved captured latents at step {i} to {capture_save_path}")
+                
+                    if stop_after_capture:
+                        break
+            
+
+                
+
+
+                
+                
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
