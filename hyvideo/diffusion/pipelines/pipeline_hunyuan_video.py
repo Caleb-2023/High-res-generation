@@ -139,7 +139,10 @@ def retrieve_timesteps(
 
 @dataclass
 class HunyuanVideoPipelineOutput(BaseOutput):
-    videos: Union[torch.Tensor, np.ndarray]
+    videos: Optional[Union[torch.Tensor, np.ndarray]] = None
+    captured_latents: Optional[torch.Tensor] = None
+    captured_timestep: Optional[Union[torch.Tensor, float, int]] = None
+    captured_step: Optional[int] = None
 
 
 class HunyuanVideoPipeline(DiffusionPipeline):
@@ -567,6 +570,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         device,
         generator,
         latents=None,
+        init_latents=None,
     ):
         shape = (
             batch_size,
@@ -581,12 +585,28 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
+        if latents is not None and init_latents is not None:
+            raise ValueError("`latents` and `init_latents` cannot be passed at the same time.")
+
+        if init_latents is not None:
+            if tuple(init_latents.shape) != shape:
+                raise ValueError(
+                    f"`init_latents` has shape {tuple(init_latents.shape)}, but expected {shape} for "
+                    f"height={height}, width={width}, video_length={video_length}."
+                )
+            return init_latents.to(device=device, dtype=dtype)
+
         if latents is None:
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
         else:
-            latents = latents.to(device)
+            if tuple(latents.shape) != shape:
+                raise ValueError(
+                    f"`latents` has shape {tuple(latents.shape)}, but expected {shape} for "
+                    f"height={height}, width={width}, video_length={video_length}."
+                )
+            latents = latents.to(device=device, dtype=dtype)
 
         # Check existence to make it compatible with FlowMatchEulerDiscreteScheduler
         if hasattr(self.scheduler, "init_noise_sigma"):
@@ -700,11 +720,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         enable_tiling: bool = False,
         n_tokens: Optional[int] = None,
         embedded_guidance_scale: Optional[float] = None,
-        # 新增代码
         capture_step: Optional[int] = None,
         capture_save_path: Optional[str] = None,
+        return_captured_latents: bool = False,
+        start_step: Optional[int] = None,
         stop_after_capture: bool = False,
-        
+        init_latents: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         r"""
@@ -807,6 +828,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
+
+        if stop_after_capture and capture_step is None:
+            raise ValueError("`stop_after_capture=True` requires `capture_step` to be set.")
+        if start_step is not None and start_step < 0:
+            raise ValueError(f"`start_step` must be non-negative, got {start_step}.")
 
         # 0. Default height and width to unet
         # height = height or self.transformer.config.sample_size * self.vae_scale_factor
@@ -921,6 +947,25 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             sigmas,
             **extra_set_timesteps_kwargs,
         )
+        all_timesteps = timesteps
+        if start_step is None:
+            start_step = 0
+        if start_step >= len(all_timesteps):
+            raise ValueError(
+                f"`start_step` must be smaller than the number of timesteps ({len(all_timesteps)}), got {start_step}."
+            )
+        if capture_step is not None and not 0 <= capture_step < len(all_timesteps):
+            raise ValueError(
+                f"`capture_step` must be in [0, {len(all_timesteps) - 1}], got {capture_step}."
+            )
+        if capture_step is not None and capture_step < start_step:
+            raise ValueError(
+                f"`capture_step` ({capture_step}) must be >= `start_step` ({start_step})."
+            )
+        timesteps = all_timesteps[start_step:]
+        num_inference_steps = len(timesteps)
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(start_step)
 
         if "884" in vae_ver:
             video_length = (video_length - 1) // 4 + 1
@@ -941,6 +986,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             device,
             generator,
             latents,
+            init_latents=init_latents,
         )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -961,28 +1007,33 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        captured_latents = None
+        captured_t = None
+        captured_step_index = None
 
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
+            for step_offset, t in enumerate(timesteps):
+                current_step = start_step + step_offset
                 if self.interrupt:
                     continue
 
-                # 新增逻辑：只在指定 step 抓取当前 latents
-                if capture_step is not None and i == capture_step:
-                    captured_latents = latents.detach().clone().cpu()
-                    captured_t = t.detach().clone().cpu() if torch.is_tensor(t) else t
-                
+                # Capture the current z_t before applying the denoiser for this step.
+                if capture_step is not None and current_step == capture_step:
+                    captured_latents = latents.detach().clone()
+                    captured_t = t.detach().clone() if torch.is_tensor(t) else t
+                    captured_step_index = current_step
+
                     if capture_save_path is not None:
                         save_dir = os.path.dirname(capture_save_path)
                         if save_dir:
                             os.makedirs(save_dir, exist_ok=True)
-                
+
                         torch.save(
                             {
-                                "latents": captured_latents,
-                                "timestep": captured_t,
-                                "step_index": i,
+                                "latents": captured_latents.cpu(),
+                                "timestep": captured_t.cpu() if torch.is_tensor(captured_t) else captured_t,
+                                "step_index": captured_step_index,
                                 "height": height,
                                 "width": width,
                                 "video_length": video_length,
@@ -990,17 +1041,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                             },
                             capture_save_path,
                         )
-                        logger.info(f"Saved captured latents at step {i} to {capture_save_path}")
-                
+                        logger.info(
+                            f"Saved captured latents at step {captured_step_index} to {capture_save_path}"
+                        )
+
                     if stop_after_capture:
                         break
-            
-
-                
-
-
-                
-                
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -1066,7 +1112,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
                         callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    callback_outputs = callback_on_step_end(self, current_step, t, callback_kwargs)
 
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
@@ -1075,16 +1121,18 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     )
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or (
-                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                if step_offset == len(timesteps) - 1 or (
+                    (step_offset + 1) > num_warmup_steps and (step_offset + 1) % self.scheduler.order == 0
                 ):
                     if progress_bar is not None:
                         progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        step_idx = i // getattr(self.scheduler, "order", 1)
+                    if callback is not None and step_offset % callback_steps == 0:
+                        step_idx = current_step // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
-        if not output_type == "latent":
+        should_decode = not (stop_after_capture and captured_latents is not None)
+
+        if not output_type == "latent" and should_decode:
             expand_temporal_dim = False
             if len(latents.shape) == 4:
                 if isinstance(self.vae, AutoencoderKLCausal3D):
@@ -1124,17 +1172,33 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if expand_temporal_dim or image.shape[2] == 1:
                 image = image.squeeze(2)
 
-        else:
+        elif output_type == "latent" and should_decode:
             image = latents
+        else:
+            image = None
 
-        image = (image / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-        image = image.cpu().float()
+        if image is not None:
+            image = (image / 2 + 0.5).clamp(0, 1)
+            # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+            image = image.cpu().float()
 
         # Offload all models
         self.maybe_free_model_hooks()
 
-        if not return_dict:
-            return image
+        output_captured_latents = captured_latents if (return_captured_latents or stop_after_capture) else None
+        output_captured_timestep = (
+            captured_t if output_captured_latents is not None else None
+        )
+        output_captured_step = (
+            captured_step_index if output_captured_latents is not None else None
+        )
 
-        return HunyuanVideoPipelineOutput(videos=image)
+        if not return_dict:
+            return image, output_captured_latents, output_captured_timestep, output_captured_step
+
+        return HunyuanVideoPipelineOutput(
+            videos=image,
+            captured_latents=output_captured_latents,
+            captured_timestep=output_captured_timestep,
+            captured_step=output_captured_step,
+        )

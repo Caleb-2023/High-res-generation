@@ -509,6 +509,12 @@ class HunyuanVideoSampler(Inference):
         embedded_guidance_scale=None,
         batch_size=1,
         num_videos_per_prompt=1,
+        capture_step=None,
+        capture_save_path=None,
+        return_captured_latents=False,
+        start_step=None,
+        stop_after_capture=False,
+        init_latents=None,
         **kwargs,
     ):
         """
@@ -645,7 +651,7 @@ class HunyuanVideoSampler(Inference):
         # Pipeline inference
         # ========================================================================
         start_time = time.time()
-        samples = self.pipeline(
+        pipeline_output = self.pipeline(
             prompt=prompt,
             height=target_height,
             width=target_width,
@@ -663,9 +669,20 @@ class HunyuanVideoSampler(Inference):
             is_progress_bar=True,
             vae_ver=self.args.vae,
             enable_tiling=self.args.vae_tiling,
-        )[0]
+            capture_step=capture_step,
+            capture_save_path=capture_save_path,
+            return_captured_latents=return_captured_latents,
+            start_step=start_step,
+            stop_after_capture=stop_after_capture,
+            init_latents=init_latents,
+            **kwargs,
+        )
+        samples = pipeline_output.videos
         out_dict["samples"] = samples
-        out_dict["prompts"] = prompt
+        out_dict["prompts"] = prompt * num_videos_per_prompt
+        out_dict["captured_latents"] = pipeline_output.captured_latents
+        out_dict["captured_timestep"] = pipeline_output.captured_timestep
+        out_dict["captured_step"] = pipeline_output.captured_step
 
         gen_time = time.time() - start_time
         logger.info(f"Success, time: {gen_time}")
