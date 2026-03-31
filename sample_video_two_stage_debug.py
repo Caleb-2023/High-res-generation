@@ -88,7 +88,7 @@ def build_parser():
     parser.add_argument(
         "--hr-start-mode",
         type=str,
-        default="restart",
+        default="continue",
         choices=["restart", "continue"],
         help="How HR sampling starts from the mapped latent. `restart` runs a full HR denoising schedule; "
         "`continue` resumes from `capture_step`.",
