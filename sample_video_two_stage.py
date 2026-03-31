@@ -23,8 +23,8 @@ from hyvideo.utils.file_utils import save_videos_grid
 from hyvideo.utils.latent_utils import (
     decode_latents_to_video,
     encode_video_to_latents,
-    renoise_latents_with_step_ratio,
     resize_video_frames_framewise,
+    sample_noise_like,
 )
 
 
@@ -82,12 +82,21 @@ def build_two_stage_parser():
         help="Spatial interpolation mode for decoded LR video resizing before re-encoding.",
     )
     parser.add_argument(
+        "--mapping-source",
+        type=str,
+        default="clean_estimate",
+        choices=["clean_estimate", "z_t"],
+        help="Which LR latent to map into HR space. `clean_estimate` uses the denoiser-derived clean "
+        "latent at capture step; `z_t` uses the raw captured noisy latent.",
+    )
+    parser.add_argument(
         "--renoise-mode",
         type=str,
-        default="step_ratio",
-        choices=["step_ratio", "none"],
-        help="How to re-noise the mapped HR latent before resume. `step_ratio` uses "
-        "`capture_step / infer_steps * latent + (1 - capture_step / infer_steps) * noise`.",
+        default="scheduler_sigma",
+        choices=["scheduler_sigma", "step_ratio", "none"],
+        help="How to re-noise the mapped HR latent before resume. `scheduler_sigma` matches the "
+        "actual FlowMatch scheduler sigma at `capture_step`. `step_ratio` uses a linear "
+        "approximation `capture_step / infer_steps * latent + (1 - capture_step / infer_steps) * noise`.",
     )
     parser.add_argument(
         "--noise-seed-offset",
@@ -165,6 +174,8 @@ def validate_resume_timestep(args, capture_step, captured_timestep, device):
             f"Captured timestep {captured_timestep.item()} does not match scheduler timestep "
             f"{expected_timestep.item()} at step {capture_step}."
         )
+
+    return float(scheduler.sigmas[capture_step].item())
 
 
 def summarize_latents(name, latents):
@@ -252,7 +263,8 @@ def main():
     logger.info(
         f"Running two-stage baseline with capture_step={args.capture_step}, "
         f"lr_size={tuple(args.lr_size)}, hr_size={tuple(args.hr_size)}, "
-        f"interpolation={args.interpolation_mode}, renoise_mode={args.renoise_mode}, "
+        f"mapping_source={args.mapping_source}, interpolation={args.interpolation_mode}, "
+        f"renoise_mode={args.renoise_mode}, "
         f"match_init_stats={args.match_init_stats}, noise_seed_offset={args.noise_seed_offset}"
     )
 
@@ -276,18 +288,38 @@ def main():
     )
 
     captured_latents = lr_outputs["captured_latents"]
+    captured_clean_latents = lr_outputs["captured_clean_latents"]
     captured_step = lr_outputs["captured_step"]
     captured_timestep = lr_outputs["captured_timestep"]
     if captured_latents is None or captured_step is None or captured_timestep is None:
         raise ValueError("Failed to capture LR intermediate latent z_t.")
+    if args.mapping_source == "clean_estimate" and captured_clean_latents is None:
+        raise ValueError("Failed to capture LR clean latent estimate at the selected step.")
 
-    validate_resume_timestep(
+    resume_sigma = validate_resume_timestep(
         args,
         capture_step=captured_step,
         captured_timestep=captured_timestep,
         device=captured_latents.device,
     )
     maybe_log_latents("Captured LR z_t", captured_latents, args.log_latent_stats)
+    maybe_log_latents(
+        "Captured LR clean estimate",
+        captured_clean_latents,
+        args.log_latent_stats and captured_clean_latents is not None,
+    )
+    logger.info(
+        f"Resolved capture sigma={resume_sigma:.6f} at step={captured_step} "
+        f"(signal_scale={1.0 - resume_sigma:.6f}, noise_scale={resume_sigma:.6f})"
+    )
+
+    if args.mapping_source == "clean_estimate":
+        mapping_source_latents = captured_clean_latents
+        mapping_source_label = "clean_estimate"
+    else:
+        mapping_source_latents = captured_latents
+        mapping_source_label = "z_t"
+    logger.info(f"Using `{mapping_source_label}` as the LR->HR mapping source.")
 
     hr_height = align_to(hr_height, 16)
     hr_width = align_to(hr_width, 16)
@@ -298,13 +330,13 @@ def main():
 
     lr_decoded_video = decode_latents_to_video(
         sampler.pipeline.vae,
-        captured_latents,
+        mapping_source_latents,
         vae_dtype=vae_dtype,
         autocast_enabled=vae_autocast_enabled,
         enable_tiling=args.vae_tiling,
     )
     logger.info(
-        f"Decoded LR z_t to pixel-space video with shape={tuple(lr_decoded_video.shape)}"
+        f"Decoded LR `{mapping_source_label}` to pixel-space video with shape={tuple(lr_decoded_video.shape)}"
     )
     hr_resized_video = resize_video_frames_framewise(
         lr_decoded_video,
@@ -328,7 +360,7 @@ def main():
     )
 
     if args.match_init_stats:
-        hr_encoded_latents = match_latent_stats(captured_latents, hr_encoded_latents)
+        hr_encoded_latents = match_latent_stats(mapping_source_latents, hr_encoded_latents)
         maybe_log_latents(
             "Re-encoded HR latent after stat match",
             hr_encoded_latents,
@@ -346,6 +378,7 @@ def main():
             "capture_timestep": captured_timestep.cpu()
             if torch.is_tensor(captured_timestep)
             else captured_timestep,
+            "mapping_source": mapping_source_label,
             "hr_size": (hr_height, hr_width),
             "video_length": args.video_length,
             "interpolation_mode": args.interpolation_mode,
@@ -355,15 +388,27 @@ def main():
         label="HR encoded latent",
     )
 
-    if args.renoise_mode == "step_ratio":
-        hr_init_latents, resume_noise, signal_scale, noise_scale = (
-            renoise_latents_with_step_ratio(
-                hr_encoded_latents,
-                capture_step=captured_step,
-                total_steps=args.infer_steps,
-                seeds=lr_outputs["seeds"],
-                seed_offset=args.noise_seed_offset,
-            )
+    if args.renoise_mode == "scheduler_sigma":
+        signal_scale = 1.0 - resume_sigma
+        noise_scale = resume_sigma
+        resume_noise = sample_noise_like(
+            hr_encoded_latents,
+            seeds=lr_outputs["seeds"],
+            seed_offset=args.noise_seed_offset,
+        )
+        hr_init_latents = (
+            hr_encoded_latents * signal_scale + resume_noise * noise_scale
+        )
+    elif args.renoise_mode == "step_ratio":
+        signal_scale = float(captured_step) / float(args.infer_steps)
+        noise_scale = 1.0 - signal_scale
+        resume_noise = sample_noise_like(
+            hr_encoded_latents,
+            seeds=lr_outputs["seeds"],
+            seed_offset=args.noise_seed_offset,
+        )
+        hr_init_latents = (
+            hr_encoded_latents * signal_scale + resume_noise * noise_scale
         )
     else:
         hr_init_latents = hr_encoded_latents
@@ -388,6 +433,7 @@ def main():
             "capture_timestep": captured_timestep.cpu()
             if torch.is_tensor(captured_timestep)
             else captured_timestep,
+            "mapping_source": mapping_source_label,
             "hr_size": (hr_height, hr_width),
             "video_length": args.video_length,
             "interpolation_mode": args.interpolation_mode,
@@ -396,6 +442,7 @@ def main():
             "renoise_mode": args.renoise_mode,
             "signal_scale": signal_scale,
             "noise_scale": noise_scale,
+            "resume_sigma": resume_sigma,
             "noise_seed_offset": args.noise_seed_offset,
             "per_sample_seeds": lr_outputs["seeds"],
             "has_resume_noise": resume_noise is not None,

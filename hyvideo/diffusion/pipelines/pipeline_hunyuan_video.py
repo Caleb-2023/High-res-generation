@@ -48,6 +48,7 @@ from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
+from ...utils.latent_utils import flowmatch_clean_latent_estimate
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -141,6 +142,7 @@ def retrieve_timesteps(
 class HunyuanVideoPipelineOutput(BaseOutput):
     videos: Optional[Union[torch.Tensor, np.ndarray]] = None
     captured_latents: Optional[torch.Tensor] = None
+    captured_clean_latents: Optional[torch.Tensor] = None
     captured_timestep: Optional[Union[torch.Tensor, float, int]] = None
     captured_step: Optional[int] = None
 
@@ -1008,6 +1010,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
         captured_latents = None
+        captured_clean_latents = None
         captured_t = None
         captured_step_index = None
 
@@ -1018,35 +1021,13 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 if self.interrupt:
                     continue
 
+                capture_now = capture_step is not None and current_step == capture_step
+
                 # Capture the current z_t before applying the denoiser for this step.
-                if capture_step is not None and current_step == capture_step:
+                if capture_now:
                     captured_latents = latents.detach().clone()
                     captured_t = t.detach().clone() if torch.is_tensor(t) else t
                     captured_step_index = current_step
-
-                    if capture_save_path is not None:
-                        save_dir = os.path.dirname(capture_save_path)
-                        if save_dir:
-                            os.makedirs(save_dir, exist_ok=True)
-
-                        torch.save(
-                            {
-                                "latents": captured_latents.cpu(),
-                                "timestep": captured_t.cpu() if torch.is_tensor(captured_t) else captured_t,
-                                "step_index": captured_step_index,
-                                "height": height,
-                                "width": width,
-                                "video_length": video_length,
-                                "vae_ver": vae_ver,
-                            },
-                            capture_save_path,
-                        )
-                        logger.info(
-                            f"Saved captured latents at step {captured_step_index} to {capture_save_path}"
-                        )
-
-                    if stop_after_capture:
-                        break
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -1102,6 +1083,40 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         noise_pred_text,
                         guidance_rescale=self.guidance_rescale,
                     )
+
+                if capture_now:
+                    capture_sigma = self.scheduler.sigmas[current_step]
+                    captured_clean_latents = flowmatch_clean_latent_estimate(
+                        captured_latents,
+                        noise_pred,
+                        capture_sigma,
+                    ).detach().clone()
+
+                    if capture_save_path is not None:
+                        save_dir = os.path.dirname(capture_save_path)
+                        if save_dir:
+                            os.makedirs(save_dir, exist_ok=True)
+
+                        torch.save(
+                            {
+                                "latents": captured_latents.cpu(),
+                                "clean_latents": captured_clean_latents.cpu(),
+                                "timestep": captured_t.cpu() if torch.is_tensor(captured_t) else captured_t,
+                                "step_index": captured_step_index,
+                                "sigma": float(capture_sigma.item()) if torch.is_tensor(capture_sigma) else float(capture_sigma),
+                                "height": height,
+                                "width": width,
+                                "video_length": video_length,
+                                "vae_ver": vae_ver,
+                            },
+                            capture_save_path,
+                        )
+                        logger.info(
+                            f"Saved captured latents at step {captured_step_index} to {capture_save_path}"
+                        )
+
+                    if stop_after_capture:
+                        break
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(
@@ -1186,6 +1201,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self.maybe_free_model_hooks()
 
         output_captured_latents = captured_latents if (return_captured_latents or stop_after_capture) else None
+        output_captured_clean_latents = (
+            captured_clean_latents if (return_captured_latents or stop_after_capture) else None
+        )
         output_captured_timestep = (
             captured_t if output_captured_latents is not None else None
         )
@@ -1194,11 +1212,18 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         )
 
         if not return_dict:
-            return image, output_captured_latents, output_captured_timestep, output_captured_step
+            return (
+                image,
+                output_captured_latents,
+                output_captured_clean_latents,
+                output_captured_timestep,
+                output_captured_step,
+            )
 
         return HunyuanVideoPipelineOutput(
             videos=image,
             captured_latents=output_captured_latents,
+            captured_clean_latents=output_captured_clean_latents,
             captured_timestep=output_captured_timestep,
             captured_step=output_captured_step,
         )

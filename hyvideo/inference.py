@@ -681,6 +681,7 @@ class HunyuanVideoSampler(Inference):
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt * num_videos_per_prompt
         out_dict["captured_latents"] = pipeline_output.captured_latents
+        out_dict["captured_clean_latents"] = pipeline_output.captured_clean_latents
         out_dict["captured_timestep"] = pipeline_output.captured_timestep
         out_dict["captured_step"] = pipeline_output.captured_step
 

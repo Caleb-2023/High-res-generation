@@ -1,4 +1,4 @@
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -123,6 +123,34 @@ def encode_video_to_latents(
         vae_latents = vae_latents - vae.config.shift_factor
 
     return vae_latents * vae.config.scaling_factor
+
+
+def flowmatch_clean_latent_estimate(
+    noisy_latents: torch.Tensor,
+    model_output: torch.Tensor,
+    sigma: Union[float, torch.Tensor],
+) -> torch.Tensor:
+    """Estimate clean latents from a FlowMatch noisy state and model prediction.
+
+    Under the linear interpolation parameterization x_sigma = (1 - sigma) * x0 + sigma * eps,
+    the denoiser predicts dx/dsigma = eps - x0, so x0 = x_sigma - sigma * model_output.
+    """
+    if noisy_latents.shape != model_output.shape:
+        raise ValueError(
+            f"`noisy_latents` and `model_output` must have the same shape, got "
+            f"{tuple(noisy_latents.shape)} and {tuple(model_output.shape)}."
+        )
+
+    if not torch.is_tensor(sigma):
+        sigma = torch.tensor(
+            sigma,
+            device=noisy_latents.device,
+            dtype=noisy_latents.dtype,
+        )
+    else:
+        sigma = sigma.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
+
+    return noisy_latents - sigma * model_output.to(noisy_latents.dtype)
 
 
 def compute_step_ratio_mix_scales(

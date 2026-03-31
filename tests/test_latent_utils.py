@@ -2,6 +2,7 @@ import torch
 
 from hyvideo.utils.latent_utils import (
     compute_step_ratio_mix_scales,
+    flowmatch_clean_latent_estimate,
     interpolate_spatial_latents_framewise,
     renoise_latents_with_step_ratio,
     resize_video_frames_framewise,
@@ -85,3 +86,17 @@ def test_renoise_latents_with_step_ratio_matches_linear_blend_rule():
     assert noise_scale == 0.5
     torch.testing.assert_close(noise, expected_noise)
     torch.testing.assert_close(mixed, expected_mixed)
+
+
+def test_flowmatch_clean_latent_estimate_uses_xt_minus_sigma_u():
+    noisy_latents = torch.full((1, 1, 1, 2, 2), 3.0)
+    model_output = torch.full((1, 1, 1, 2, 2), 2.0)
+
+    clean = flowmatch_clean_latent_estimate(
+        noisy_latents,
+        model_output,
+        sigma=0.25,
+    )
+
+    expected = torch.full((1, 1, 1, 2, 2), 2.5)
+    torch.testing.assert_close(clean, expected)

@@ -14,7 +14,7 @@ python3 sample_video_two_stage.py \
     --flow-shift 7.0 \
     --flow-reverse \
     --hr-start-mode continue \
-    --renoise-mode step_ratio \
+    --renoise-mode scheduler_sigma \
     --use-cpu-offload \
     --save-path ./results \
     "$@"
