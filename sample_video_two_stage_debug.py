@@ -15,11 +15,16 @@ from hyvideo.config import (
     add_parallel_args,
     sanity_check_args,
 )
+from hyvideo.constants import PRECISION_TO_TYPE
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.inference import HunyuanVideoSampler
 from hyvideo.utils.data_utils import align_to
 from hyvideo.utils.file_utils import save_videos_grid
-from hyvideo.utils.latent_utils import interpolate_spatial_latents_framewise
+from hyvideo.utils.latent_utils import (
+    decode_latents_to_video,
+    encode_video_to_latents,
+    resize_video_frames_framewise,
+)
 
 
 DEFAULT_CAPTURE_DIR = "/root/autodl-tmp/HunyuanVideo/HunyuanVideo/capture_latents"
@@ -68,7 +73,7 @@ def build_parser():
         type=str,
         default="bilinear",
         choices=["nearest", "bilinear", "bicubic", "area"],
-        help="Spatial interpolation mode for LR-to-HR latent mapping.",
+        help="Spatial interpolation mode for decoded LR video resizing before re-encoding.",
     )
     parser.add_argument(
         "--match-init-stats",
@@ -223,20 +228,41 @@ def main():
 
     hr_height = align_to(hr_height, 16)
     hr_width = align_to(hr_width, 16)
-    latent_target_size = (
-        hr_height // sampler.pipeline.vae_scale_factor,
-        hr_width // sampler.pipeline.vae_scale_factor,
-    )
-    hr_init_latents = interpolate_spatial_latents_framewise(
+    vae_dtype = PRECISION_TO_TYPE[args.vae_precision]
+    vae_autocast_enabled = (
+        vae_dtype != torch.float32
+    ) and not args.disable_autocast
+
+    lr_decoded_video = decode_latents_to_video(
+        sampler.pipeline.vae,
         captured_latents,
-        target_size=latent_target_size,
+        vae_dtype=vae_dtype,
+        autocast_enabled=vae_autocast_enabled,
+        enable_tiling=args.vae_tiling,
+    )
+    logger.info(
+        f"Decoded LR video in pixel space with shape={tuple(lr_decoded_video.shape)}"
+    )
+    hr_resized_video = resize_video_frames_framewise(
+        lr_decoded_video,
+        target_size=(hr_height, hr_width),
         mode=args.interpolation_mode,
     )
-    summarize_latents("Interpolated HR init before stat match", hr_init_latents)
+    logger.info(
+        f"Resized decoded HR video in pixel space to shape={tuple(hr_resized_video.shape)}"
+    )
+    hr_init_latents = encode_video_to_latents(
+        sampler.pipeline.vae,
+        hr_resized_video,
+        vae_dtype=vae_dtype,
+        autocast_enabled=vae_autocast_enabled,
+        enable_tiling=args.vae_tiling,
+    )
+    summarize_latents("Re-encoded HR init before stat match", hr_init_latents)
 
     if args.match_init_stats:
         hr_init_latents = match_latent_stats(captured_latents, hr_init_latents)
-        summarize_latents("Interpolated HR init after stat match", hr_init_latents)
+        summarize_latents("Re-encoded HR init after stat match", hr_init_latents)
 
     torch.save(
         {
@@ -248,6 +274,7 @@ def main():
             "video_length": args.video_length,
             "interpolation_mode": args.interpolation_mode,
             "match_init_stats": args.match_init_stats,
+            "mapping_space": "image",
         },
         hr_init_path,
     )
@@ -269,7 +296,7 @@ def main():
         start_step=captured_step,
         init_latents=hr_init_latents,
     )
-    save_video_outputs(hr_outputs, save_path, tag=f"two_stage_debug_{tag}")
+    save_video_outputs(hr_outputs, save_path, tag=f"two_stage_image_space_debug_{tag}")
 
     if args.run_direct_hr:
         logger.info("Running direct HR baseline for comparison")

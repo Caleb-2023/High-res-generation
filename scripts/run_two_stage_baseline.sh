@@ -6,7 +6,7 @@ python3 sample_video_two_stage.py \
     --hr-size 720 1280 \
     --video-length 129 \
     --infer-steps 50 \
-    --capture-step 25 \
+    --capture-step 35 \
     --prompt "A cat walks on the grass, realistic style." \
     --seed 42 \
     --embedded-cfg-scale 6.0 \

@@ -15,11 +15,16 @@ from hyvideo.config import (
     add_parallel_args,
     sanity_check_args,
 )
+from hyvideo.constants import PRECISION_TO_TYPE
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.inference import HunyuanVideoSampler
 from hyvideo.utils.data_utils import align_to
 from hyvideo.utils.file_utils import save_videos_grid
-from hyvideo.utils.latent_utils import interpolate_spatial_latents_framewise
+from hyvideo.utils.latent_utils import (
+    decode_latents_to_video,
+    encode_video_to_latents,
+    resize_video_frames_framewise,
+)
 
 
 def build_two_stage_parser():
@@ -65,7 +70,7 @@ def build_two_stage_parser():
         type=str,
         default="bilinear",
         choices=["nearest", "bilinear", "bicubic", "area"],
-        help="Spatial interpolation mode for LR-to-HR latent mapping.",
+        help="Spatial interpolation mode for decoded LR video resizing before re-encoding.",
     )
     return parser
 
@@ -166,14 +171,29 @@ def main():
 
     hr_height = align_to(hr_height, 16)
     hr_width = align_to(hr_width, 16)
-    latent_target_size = (
-        hr_height // sampler.pipeline.vae_scale_factor,
-        hr_width // sampler.pipeline.vae_scale_factor,
-    )
-    hr_init_latents = interpolate_spatial_latents_framewise(
+    vae_dtype = PRECISION_TO_TYPE[args.vae_precision]
+    vae_autocast_enabled = (
+        vae_dtype != torch.float32
+    ) and not args.disable_autocast
+
+    lr_decoded_video = decode_latents_to_video(
+        sampler.pipeline.vae,
         captured_latents,
-        target_size=latent_target_size,
+        vae_dtype=vae_dtype,
+        autocast_enabled=vae_autocast_enabled,
+        enable_tiling=args.vae_tiling,
+    )
+    hr_resized_video = resize_video_frames_framewise(
+        lr_decoded_video,
+        target_size=(hr_height, hr_width),
         mode=args.interpolation_mode,
+    )
+    hr_init_latents = encode_video_to_latents(
+        sampler.pipeline.vae,
+        hr_resized_video,
+        vae_dtype=vae_dtype,
+        autocast_enabled=vae_autocast_enabled,
+        enable_tiling=args.vae_tiling,
     )
 
     hr_outputs = sampler.predict(
@@ -193,7 +213,7 @@ def main():
         init_latents=hr_init_latents,
     )
 
-    save_outputs(hr_outputs, save_path, tag=f"two_stage_step{captured_step}")
+    save_outputs(hr_outputs, save_path, tag=f"two_stage_image_space_step{captured_step}")
 
 
 if __name__ == "__main__":
