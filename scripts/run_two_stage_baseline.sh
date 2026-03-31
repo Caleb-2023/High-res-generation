@@ -12,5 +12,6 @@ python3 sample_video_two_stage.py \
     --embedded-cfg-scale 6.0 \
     --flow-shift 7.0 \
     --flow-reverse \
+    --hr-start-mode restart \
     --use-cpu-offload \
     --save-path ./results

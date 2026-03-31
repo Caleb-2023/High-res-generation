@@ -85,6 +85,14 @@ def build_parser():
         action="store_true",
         help="Also run a direct HR baseline from pure noise for comparison.",
     )
+    parser.add_argument(
+        "--hr-start-mode",
+        type=str,
+        default="restart",
+        choices=["restart", "continue"],
+        help="How HR sampling starts from the mapped latent. `restart` runs a full HR denoising schedule; "
+        "`continue` resumes from `capture_step`.",
+    )
     return parser
 
 
@@ -190,7 +198,7 @@ def main():
     logger.info(
         f"Running LR capture with capture_step={args.capture_step}, lr_size={tuple(args.lr_size)}, "
         f"hr_size={tuple(args.hr_size)}, interpolation={args.interpolation_mode}, "
-        f"match_init_stats={args.match_init_stats}"
+        f"match_init_stats={args.match_init_stats}, hr_start_mode={args.hr_start_mode}"
     )
 
     lr_outputs = sampler.predict(
@@ -275,10 +283,15 @@ def main():
             "interpolation_mode": args.interpolation_mode,
             "match_init_stats": args.match_init_stats,
             "mapping_space": "image",
+            "hr_start_mode": args.hr_start_mode,
         },
         hr_init_path,
     )
     logger.info(f"Saved HR init latents to: {hr_init_path}")
+
+    hr_predict_kwargs = {}
+    if args.hr_start_mode == "continue":
+        hr_predict_kwargs["start_step"] = captured_step
 
     hr_outputs = sampler.predict(
         prompt=args.prompt,
@@ -293,10 +306,14 @@ def main():
         flow_shift=args.flow_shift,
         batch_size=args.batch_size,
         embedded_guidance_scale=args.embedded_cfg_scale,
-        start_step=captured_step,
         init_latents=hr_init_latents,
+        **hr_predict_kwargs,
     )
-    save_video_outputs(hr_outputs, save_path, tag=f"two_stage_image_space_debug_{tag}")
+    save_video_outputs(
+        hr_outputs,
+        save_path,
+        tag=f"two_stage_image_space_debug_{args.hr_start_mode}_{tag}",
+    )
 
     if args.run_direct_hr:
         logger.info("Running direct HR baseline for comparison")

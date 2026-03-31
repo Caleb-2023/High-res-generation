@@ -72,6 +72,14 @@ def build_two_stage_parser():
         choices=["nearest", "bilinear", "bicubic", "area"],
         help="Spatial interpolation mode for decoded LR video resizing before re-encoding.",
     )
+    parser.add_argument(
+        "--hr-start-mode",
+        type=str,
+        default="restart",
+        choices=["restart", "continue"],
+        help="How HR sampling starts from the mapped latent. `restart` runs a full HR denoising schedule; "
+        "`continue` resumes from `capture_step`.",
+    )
     return parser
 
 
@@ -196,6 +204,10 @@ def main():
         enable_tiling=args.vae_tiling,
     )
 
+    hr_predict_kwargs = {}
+    if args.hr_start_mode == "continue":
+        hr_predict_kwargs["start_step"] = captured_step
+
     hr_outputs = sampler.predict(
         prompt=args.prompt,
         height=hr_height,
@@ -209,11 +221,15 @@ def main():
         flow_shift=args.flow_shift,
         batch_size=args.batch_size,
         embedded_guidance_scale=args.embedded_cfg_scale,
-        start_step=captured_step,
         init_latents=hr_init_latents,
+        **hr_predict_kwargs,
     )
 
-    save_outputs(hr_outputs, save_path, tag=f"two_stage_image_space_step{captured_step}")
+    save_outputs(
+        hr_outputs,
+        save_path,
+        tag=f"two_stage_image_space_{args.hr_start_mode}_step{captured_step}",
+    )
 
 
 if __name__ == "__main__":
