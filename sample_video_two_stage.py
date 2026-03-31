@@ -23,6 +23,7 @@ from hyvideo.utils.file_utils import save_videos_grid
 from hyvideo.utils.latent_utils import (
     decode_latents_to_video,
     encode_video_to_latents,
+    renoise_latents_with_step_ratio,
     resize_video_frames_framewise,
 )
 
@@ -63,7 +64,15 @@ def build_two_stage_parser():
         "--capture-save-path",
         type=str,
         default="",
-        help="Optional path to save the captured LR latent payload.",
+        help="Optional explicit file path for the captured LR latent payload.",
+    )
+    parser.add_argument(
+        "--debug-latent-dir",
+        "--capture-dir",
+        dest="debug_latent_dir",
+        type=str,
+        default="",
+        help="Optional directory used to save LR z_t, mapped HR latent, and noised HR init latent payloads.",
     )
     parser.add_argument(
         "--interpolation-mode",
@@ -73,14 +82,64 @@ def build_two_stage_parser():
         help="Spatial interpolation mode for decoded LR video resizing before re-encoding.",
     )
     parser.add_argument(
+        "--renoise-mode",
+        type=str,
+        default="step_ratio",
+        choices=["step_ratio", "none"],
+        help="How to re-noise the mapped HR latent before resume. `step_ratio` uses "
+        "`capture_step / infer_steps * latent + (1 - capture_step / infer_steps) * noise`.",
+    )
+    parser.add_argument(
+        "--noise-seed-offset",
+        type=int,
+        default=0,
+        help="Offset added to each sample seed when drawing HR re-noise.",
+    )
+    parser.add_argument(
+        "--match-init-stats",
+        action="store_true",
+        help="Match per-channel mean/std of the mapped HR latent to the captured LR latent before re-noising.",
+    )
+    parser.add_argument(
+        "--log-latent-stats",
+        action="store_true",
+        help="Log shape/mean/std/min/max for captured, mapped, and noised HR latents.",
+    )
+    parser.add_argument(
+        "--run-direct-hr",
+        action="store_true",
+        help="Also run a direct HR baseline from pure noise for comparison.",
+    )
+    parser.add_argument(
         "--hr-start-mode",
         type=str,
         default="continue",
-        choices=["restart", "continue"],
-        help="How HR sampling starts from the mapped latent. `restart` runs a full HR denoising schedule; "
-        "`continue` resumes from `capture_step`.",
+        choices=["continue"],
+        help="HR resume mode. Only `continue` is supported for step-matched re-noising.",
     )
     return parser
+
+
+def timestamp():
+    return datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%H:%M:%S")
+
+
+def save_video_outputs(outputs, save_dir, tag):
+    samples = outputs["samples"]
+    if samples is None:
+        raise ValueError(f"No decoded samples were returned for tag `{tag}`.")
+
+    saved_paths = []
+    for i, sample in enumerate(samples):
+        sample = sample.unsqueeze(0)
+        prompt_prefix = outputs["prompts"][i][:100].replace("/", "")
+        video_path = (
+            f"{save_dir}/{timestamp()}_{tag}_seed{outputs['seeds'][i]}_{prompt_prefix}.mp4"
+        )
+        save_videos_grid(sample, video_path, fps=24)
+        logger.info(f"Saved {tag} video to: {video_path}")
+        saved_paths.append(video_path)
+    return saved_paths
 
 
 def validate_resume_timestep(args, capture_step, captured_timestep, device):
@@ -93,7 +152,9 @@ def validate_resume_timestep(args, capture_step, captured_timestep, device):
     expected_timestep = scheduler.timesteps[capture_step]
 
     if torch.is_tensor(captured_timestep):
-        captured_timestep = captured_timestep.to(device=device, dtype=expected_timestep.dtype)
+        captured_timestep = captured_timestep.to(
+            device=device, dtype=expected_timestep.dtype
+        )
     else:
         captured_timestep = torch.tensor(
             captured_timestep, device=device, dtype=expected_timestep.dtype
@@ -106,20 +167,44 @@ def validate_resume_timestep(args, capture_step, captured_timestep, device):
         )
 
 
-def save_outputs(outputs, save_dir, tag):
-    samples = outputs["samples"]
-    if samples is None:
-        raise ValueError("No decoded samples were returned.")
+def summarize_latents(name, latents):
+    latents = latents.detach().float().cpu()
+    stats = {
+        "shape": tuple(latents.shape),
+        "mean": latents.mean().item(),
+        "std": latents.std().item(),
+        "min": latents.min().item(),
+        "max": latents.max().item(),
+    }
+    logger.info(
+        f"{name}: shape={stats['shape']}, mean={stats['mean']:.6f}, std={stats['std']:.6f}, "
+        f"min={stats['min']:.6f}, max={stats['max']:.6f}"
+    )
+    return stats
 
-    for i, sample in enumerate(samples):
-        sample = sample.unsqueeze(0)
-        time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%H:%M:%S")
-        prompt_prefix = outputs["prompts"][i][:100].replace("/", "")
-        cur_save_path = (
-            f"{save_dir}/{time_flag}_{tag}_seed{outputs['seeds'][i]}_{prompt_prefix}.mp4"
-        )
-        save_videos_grid(sample, cur_save_path, fps=24)
-        logger.info(f"Sample saved to: {cur_save_path}")
+
+def match_latent_stats(source_latents, target_latents, eps=1e-6):
+    reduce_dims = (2, 3, 4)
+    src_mean = source_latents.mean(dim=reduce_dims, keepdim=True)
+    src_std = source_latents.std(dim=reduce_dims, keepdim=True)
+    tgt_mean = target_latents.mean(dim=reduce_dims, keepdim=True)
+    tgt_std = target_latents.std(dim=reduce_dims, keepdim=True)
+    normalized = (target_latents - tgt_mean) / torch.clamp(tgt_std, min=eps)
+    return normalized * src_std + src_mean
+
+
+def maybe_log_latents(name, latents, enabled):
+    if enabled:
+        summarize_latents(name, latents)
+
+
+def save_latent_payload(path, payload, label):
+    if path is None:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+    logger.info(f"Saved {label} payload to: {path}")
 
 
 def main():
@@ -138,12 +223,38 @@ def main():
     )
     os.makedirs(save_path, exist_ok=True)
 
+    debug_latent_dir = Path(args.debug_latent_dir) if args.debug_latent_dir else None
+    if debug_latent_dir is not None:
+        debug_latent_dir.mkdir(parents=True, exist_ok=True)
+
     sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
     args = sampler.args
 
+    run_tag = f"step{args.capture_step}_seed{args.seed if args.seed is not None else 'auto'}"
     lr_height, lr_width = args.lr_size
     hr_height, hr_width = args.hr_size
-    capture_save_path = args.capture_save_path or None
+
+    auto_capture_path = (
+        debug_latent_dir / f"{run_tag}_lr_z_t.pt" if debug_latent_dir is not None else None
+    )
+    capture_save_path = (
+        Path(args.capture_save_path)
+        if args.capture_save_path
+        else auto_capture_path
+    )
+    hr_encoded_path = (
+        debug_latent_dir / f"{run_tag}_hr_encoded.pt" if debug_latent_dir is not None else None
+    )
+    hr_init_path = (
+        debug_latent_dir / f"{run_tag}_hr_init_noisy.pt" if debug_latent_dir is not None else None
+    )
+
+    logger.info(
+        f"Running two-stage baseline with capture_step={args.capture_step}, "
+        f"lr_size={tuple(args.lr_size)}, hr_size={tuple(args.hr_size)}, "
+        f"interpolation={args.interpolation_mode}, renoise_mode={args.renoise_mode}, "
+        f"match_init_stats={args.match_init_stats}, noise_seed_offset={args.noise_seed_offset}"
+    )
 
     lr_outputs = sampler.predict(
         prompt=args.prompt,
@@ -159,7 +270,7 @@ def main():
         batch_size=args.batch_size,
         embedded_guidance_scale=args.embedded_cfg_scale,
         capture_step=args.capture_step,
-        capture_save_path=capture_save_path,
+        capture_save_path=str(capture_save_path) if capture_save_path is not None else None,
         return_captured_latents=True,
         stop_after_capture=True,
     )
@@ -176,6 +287,7 @@ def main():
         captured_timestep=captured_timestep,
         device=captured_latents.device,
     )
+    maybe_log_latents("Captured LR z_t", captured_latents, args.log_latent_stats)
 
     hr_height = align_to(hr_height, 16)
     hr_width = align_to(hr_width, 16)
@@ -191,22 +303,105 @@ def main():
         autocast_enabled=vae_autocast_enabled,
         enable_tiling=args.vae_tiling,
     )
+    logger.info(
+        f"Decoded LR z_t to pixel-space video with shape={tuple(lr_decoded_video.shape)}"
+    )
     hr_resized_video = resize_video_frames_framewise(
         lr_decoded_video,
         target_size=(hr_height, hr_width),
         mode=args.interpolation_mode,
     )
-    hr_init_latents = encode_video_to_latents(
+    logger.info(
+        f"Resized pixel-space video to HR shape={tuple(hr_resized_video.shape)}"
+    )
+    hr_encoded_latents = encode_video_to_latents(
         sampler.pipeline.vae,
         hr_resized_video,
         vae_dtype=vae_dtype,
         autocast_enabled=vae_autocast_enabled,
         enable_tiling=args.vae_tiling,
     )
+    maybe_log_latents(
+        "Re-encoded HR latent before stat match",
+        hr_encoded_latents,
+        args.log_latent_stats,
+    )
 
-    hr_predict_kwargs = {}
-    if args.hr_start_mode == "continue":
-        hr_predict_kwargs["start_step"] = captured_step
+    if args.match_init_stats:
+        hr_encoded_latents = match_latent_stats(captured_latents, hr_encoded_latents)
+        maybe_log_latents(
+            "Re-encoded HR latent after stat match",
+            hr_encoded_latents,
+            args.log_latent_stats,
+        )
+
+    save_latent_payload(
+        hr_encoded_path,
+        {
+            "latents": hr_encoded_latents.detach().cpu(),
+            "source_capture_path": str(capture_save_path)
+            if capture_save_path is not None
+            else None,
+            "capture_step": captured_step,
+            "capture_timestep": captured_timestep.cpu()
+            if torch.is_tensor(captured_timestep)
+            else captured_timestep,
+            "hr_size": (hr_height, hr_width),
+            "video_length": args.video_length,
+            "interpolation_mode": args.interpolation_mode,
+            "match_init_stats": args.match_init_stats,
+            "mapping_space": "image",
+        },
+        label="HR encoded latent",
+    )
+
+    if args.renoise_mode == "step_ratio":
+        hr_init_latents, resume_noise, signal_scale, noise_scale = (
+            renoise_latents_with_step_ratio(
+                hr_encoded_latents,
+                capture_step=captured_step,
+                total_steps=args.infer_steps,
+                seeds=lr_outputs["seeds"],
+                seed_offset=args.noise_seed_offset,
+            )
+        )
+    else:
+        hr_init_latents = hr_encoded_latents
+        resume_noise = None
+        signal_scale = 1.0
+        noise_scale = 0.0
+
+    logger.info(
+        f"Prepared HR init latent with signal_scale={signal_scale:.6f}, "
+        f"noise_scale={noise_scale:.6f}, start_step={captured_step}"
+    )
+    maybe_log_latents("Noised HR init latent", hr_init_latents, args.log_latent_stats)
+
+    save_latent_payload(
+        hr_init_path,
+        {
+            "latents": hr_init_latents.detach().cpu(),
+            "source_capture_path": str(capture_save_path)
+            if capture_save_path is not None
+            else None,
+            "capture_step": captured_step,
+            "capture_timestep": captured_timestep.cpu()
+            if torch.is_tensor(captured_timestep)
+            else captured_timestep,
+            "hr_size": (hr_height, hr_width),
+            "video_length": args.video_length,
+            "interpolation_mode": args.interpolation_mode,
+            "match_init_stats": args.match_init_stats,
+            "mapping_space": "image",
+            "renoise_mode": args.renoise_mode,
+            "signal_scale": signal_scale,
+            "noise_scale": noise_scale,
+            "noise_seed_offset": args.noise_seed_offset,
+            "per_sample_seeds": lr_outputs["seeds"],
+            "has_resume_noise": resume_noise is not None,
+        },
+        label="HR init latent",
+    )
 
     hr_outputs = sampler.predict(
         prompt=args.prompt,
@@ -221,15 +416,32 @@ def main():
         flow_shift=args.flow_shift,
         batch_size=args.batch_size,
         embedded_guidance_scale=args.embedded_cfg_scale,
+        start_step=captured_step,
         init_latents=hr_init_latents,
-        **hr_predict_kwargs,
     )
-
-    save_outputs(
+    save_video_outputs(
         hr_outputs,
         save_path,
-        tag=f"two_stage_image_space_{args.hr_start_mode}_step{captured_step}",
+        tag=f"two_stage_{args.renoise_mode}_{run_tag}",
     )
+
+    if args.run_direct_hr:
+        logger.info("Running direct HR baseline from pure noise for comparison")
+        direct_hr_outputs = sampler.predict(
+            prompt=args.prompt,
+            height=hr_height,
+            width=hr_width,
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=args.infer_steps,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale,
+        )
+        save_video_outputs(direct_hr_outputs, save_path, tag=f"direct_hr_{run_tag}")
 
 
 if __name__ == "__main__":

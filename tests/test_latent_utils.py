@@ -1,8 +1,11 @@
 import torch
 
 from hyvideo.utils.latent_utils import (
+    compute_step_ratio_mix_scales,
     interpolate_spatial_latents_framewise,
+    renoise_latents_with_step_ratio,
     resize_video_frames_framewise,
+    sample_noise_like,
 )
 
 
@@ -52,3 +55,33 @@ def test_resize_video_frames_framewise_matches_per_frame_interpolation():
     expected = torch.stack(expected_frames, dim=2)
 
     torch.testing.assert_close(resized, expected)
+
+
+def test_compute_step_ratio_mix_scales_matches_expected_example():
+    signal_scale, noise_scale = compute_step_ratio_mix_scales(
+        capture_step=10,
+        total_steps=25,
+    )
+
+    assert signal_scale == 10 / 25
+    assert noise_scale == 15 / 25
+
+
+def test_renoise_latents_with_step_ratio_matches_linear_blend_rule():
+    latents = torch.ones(2, 1, 1, 2, 2)
+    seeds = [123, 456]
+
+    mixed, noise, signal_scale, noise_scale = renoise_latents_with_step_ratio(
+        latents,
+        capture_step=2,
+        total_steps=4,
+        seeds=seeds,
+    )
+
+    expected_noise = sample_noise_like(latents, seeds=seeds)
+    expected_mixed = latents * 0.5 + expected_noise * 0.5
+
+    assert signal_scale == 0.5
+    assert noise_scale == 0.5
+    torch.testing.assert_close(noise, expected_noise)
+    torch.testing.assert_close(mixed, expected_mixed)
