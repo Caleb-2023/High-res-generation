@@ -67,12 +67,14 @@ def build_two_stage_parser():
         help="Optional explicit file path for the captured LR latent payload.",
     )
     parser.add_argument(
+        "--latent-dump-dir",
         "--debug-latent-dir",
         "--capture-dir",
-        dest="debug_latent_dir",
+        dest="latent_dump_dir",
         type=str,
         default="",
-        help="Optional directory used to save LR z_t, mapped HR latent, and noised HR init latent payloads.",
+        help="Optional directory used to save intermediate latent artifacts, including LR z_t, "
+        "HR encoded latent, and HR noised init latent.",
     )
     parser.add_argument(
         "--interpolation-mode",
@@ -82,49 +84,9 @@ def build_two_stage_parser():
         help="Spatial interpolation mode for decoded LR video resizing before re-encoding.",
     )
     parser.add_argument(
-        "--mapping-source",
-        type=str,
-        default="clean_estimate",
-        choices=["clean_estimate", "z_t"],
-        help="Which LR latent to map into HR space. `clean_estimate` uses the denoiser-derived clean "
-        "latent at capture step; `z_t` uses the raw captured noisy latent.",
-    )
-    parser.add_argument(
-        "--renoise-mode",
-        type=str,
-        default="scheduler_sigma",
-        choices=["scheduler_sigma", "step_ratio", "none"],
-        help="How to re-noise the mapped HR latent before resume. `scheduler_sigma` matches the "
-        "actual FlowMatch scheduler sigma at `capture_step`. `step_ratio` uses a linear "
-        "approximation `capture_step / infer_steps * latent + (1 - capture_step / infer_steps) * noise`.",
-    )
-    parser.add_argument(
-        "--noise-seed-offset",
-        type=int,
-        default=0,
-        help="Offset added to each sample seed when drawing HR re-noise.",
-    )
-    parser.add_argument(
-        "--match-init-stats",
-        action="store_true",
-        help="Match per-channel mean/std of the mapped HR latent to the captured LR latent before re-noising.",
-    )
-    parser.add_argument(
         "--log-latent-stats",
         action="store_true",
         help="Log shape/mean/std/min/max for captured, mapped, and noised HR latents.",
-    )
-    parser.add_argument(
-        "--run-direct-hr",
-        action="store_true",
-        help="Also run a direct HR baseline from pure noise for comparison.",
-    )
-    parser.add_argument(
-        "--hr-start-mode",
-        type=str,
-        default="continue",
-        choices=["continue"],
-        help="HR resume mode. Only `continue` is supported for step-matched re-noising.",
     )
     return parser
 
@@ -194,16 +156,6 @@ def summarize_latents(name, latents):
     return stats
 
 
-def match_latent_stats(source_latents, target_latents, eps=1e-6):
-    reduce_dims = (2, 3, 4)
-    src_mean = source_latents.mean(dim=reduce_dims, keepdim=True)
-    src_std = source_latents.std(dim=reduce_dims, keepdim=True)
-    tgt_mean = target_latents.mean(dim=reduce_dims, keepdim=True)
-    tgt_std = target_latents.std(dim=reduce_dims, keepdim=True)
-    normalized = (target_latents - tgt_mean) / torch.clamp(tgt_std, min=eps)
-    return normalized * src_std + src_mean
-
-
 def maybe_log_latents(name, latents, enabled):
     if enabled:
         summarize_latents(name, latents)
@@ -234,9 +186,9 @@ def main():
     )
     os.makedirs(save_path, exist_ok=True)
 
-    debug_latent_dir = Path(args.debug_latent_dir) if args.debug_latent_dir else None
-    if debug_latent_dir is not None:
-        debug_latent_dir.mkdir(parents=True, exist_ok=True)
+    latent_dump_dir = Path(args.latent_dump_dir) if args.latent_dump_dir else None
+    if latent_dump_dir is not None:
+        latent_dump_dir.mkdir(parents=True, exist_ok=True)
 
     sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
     args = sampler.args
@@ -246,7 +198,7 @@ def main():
     hr_height, hr_width = args.hr_size
 
     auto_capture_path = (
-        debug_latent_dir / f"{run_tag}_lr_z_t.pt" if debug_latent_dir is not None else None
+        latent_dump_dir / f"{run_tag}_lr_z_t.pt" if latent_dump_dir is not None else None
     )
     capture_save_path = (
         Path(args.capture_save_path)
@@ -254,18 +206,17 @@ def main():
         else auto_capture_path
     )
     hr_encoded_path = (
-        debug_latent_dir / f"{run_tag}_hr_encoded.pt" if debug_latent_dir is not None else None
+        latent_dump_dir / f"{run_tag}_hr_encoded.pt" if latent_dump_dir is not None else None
     )
     hr_init_path = (
-        debug_latent_dir / f"{run_tag}_hr_init_noisy.pt" if debug_latent_dir is not None else None
+        latent_dump_dir / f"{run_tag}_hr_init_noisy.pt" if latent_dump_dir is not None else None
     )
 
     logger.info(
         f"Running two-stage baseline with capture_step={args.capture_step}, "
         f"lr_size={tuple(args.lr_size)}, hr_size={tuple(args.hr_size)}, "
-        f"mapping_source={args.mapping_source}, interpolation={args.interpolation_mode}, "
-        f"renoise_mode={args.renoise_mode}, "
-        f"match_init_stats={args.match_init_stats}, noise_seed_offset={args.noise_seed_offset}"
+        f"mapping_source=clean_estimate, interpolation={args.interpolation_mode}, "
+        f"renoise_mode=scheduler_sigma"
     )
 
     lr_outputs = sampler.predict(
@@ -293,7 +244,7 @@ def main():
     captured_timestep = lr_outputs["captured_timestep"]
     if captured_latents is None or captured_step is None or captured_timestep is None:
         raise ValueError("Failed to capture LR intermediate latent z_t.")
-    if args.mapping_source == "clean_estimate" and captured_clean_latents is None:
+    if captured_clean_latents is None:
         raise ValueError("Failed to capture LR clean latent estimate at the selected step.")
 
     resume_sigma = validate_resume_timestep(
@@ -313,12 +264,8 @@ def main():
         f"(signal_scale={1.0 - resume_sigma:.6f}, noise_scale={resume_sigma:.6f})"
     )
 
-    if args.mapping_source == "clean_estimate":
-        mapping_source_latents = captured_clean_latents
-        mapping_source_label = "clean_estimate"
-    else:
-        mapping_source_latents = captured_latents
-        mapping_source_label = "z_t"
+    mapping_source_latents = captured_clean_latents
+    mapping_source_label = "clean_estimate"
     logger.info(f"Using `{mapping_source_label}` as the LR->HR mapping source.")
 
     hr_height = align_to(hr_height, 16)
@@ -359,14 +306,6 @@ def main():
         args.log_latent_stats,
     )
 
-    if args.match_init_stats:
-        hr_encoded_latents = match_latent_stats(mapping_source_latents, hr_encoded_latents)
-        maybe_log_latents(
-            "Re-encoded HR latent after stat match",
-            hr_encoded_latents,
-            args.log_latent_stats,
-        )
-
     save_latent_payload(
         hr_encoded_path,
         {
@@ -382,39 +321,19 @@ def main():
             "hr_size": (hr_height, hr_width),
             "video_length": args.video_length,
             "interpolation_mode": args.interpolation_mode,
-            "match_init_stats": args.match_init_stats,
             "mapping_space": "image",
         },
         label="HR encoded latent",
     )
 
-    if args.renoise_mode == "scheduler_sigma":
-        signal_scale = 1.0 - resume_sigma
-        noise_scale = resume_sigma
-        resume_noise = sample_noise_like(
-            hr_encoded_latents,
-            seeds=lr_outputs["seeds"],
-            seed_offset=args.noise_seed_offset,
-        )
-        hr_init_latents = (
-            hr_encoded_latents * signal_scale + resume_noise * noise_scale
-        )
-    elif args.renoise_mode == "step_ratio":
-        signal_scale = float(captured_step) / float(args.infer_steps)
-        noise_scale = 1.0 - signal_scale
-        resume_noise = sample_noise_like(
-            hr_encoded_latents,
-            seeds=lr_outputs["seeds"],
-            seed_offset=args.noise_seed_offset,
-        )
-        hr_init_latents = (
-            hr_encoded_latents * signal_scale + resume_noise * noise_scale
-        )
-    else:
-        hr_init_latents = hr_encoded_latents
-        resume_noise = None
-        signal_scale = 1.0
-        noise_scale = 0.0
+    signal_scale = 1.0 - resume_sigma
+    noise_scale = resume_sigma
+    resume_noise = sample_noise_like(
+        hr_encoded_latents,
+        seeds=lr_outputs["seeds"],
+        seed_offset=0,
+    )
+    hr_init_latents = hr_encoded_latents * signal_scale + resume_noise * noise_scale
 
     logger.info(
         f"Prepared HR init latent with signal_scale={signal_scale:.6f}, "
@@ -437,13 +356,12 @@ def main():
             "hr_size": (hr_height, hr_width),
             "video_length": args.video_length,
             "interpolation_mode": args.interpolation_mode,
-            "match_init_stats": args.match_init_stats,
             "mapping_space": "image",
-            "renoise_mode": args.renoise_mode,
+            "renoise_mode": "scheduler_sigma",
             "signal_scale": signal_scale,
             "noise_scale": noise_scale,
             "resume_sigma": resume_sigma,
-            "noise_seed_offset": args.noise_seed_offset,
+            "noise_seed_offset": 0,
             "per_sample_seeds": lr_outputs["seeds"],
             "has_resume_noise": resume_noise is not None,
         },
@@ -469,26 +387,8 @@ def main():
     save_video_outputs(
         hr_outputs,
         save_path,
-        tag=f"two_stage_{args.renoise_mode}_{run_tag}",
+        tag=f"two_stage_clean_estimate_scheduler_sigma_{run_tag}",
     )
-
-    if args.run_direct_hr:
-        logger.info("Running direct HR baseline from pure noise for comparison")
-        direct_hr_outputs = sampler.predict(
-            prompt=args.prompt,
-            height=hr_height,
-            width=hr_width,
-            video_length=args.video_length,
-            seed=args.seed,
-            negative_prompt=args.neg_prompt,
-            infer_steps=args.infer_steps,
-            guidance_scale=args.cfg_scale,
-            num_videos_per_prompt=args.num_videos,
-            flow_shift=args.flow_shift,
-            batch_size=args.batch_size,
-            embedded_guidance_scale=args.embedded_cfg_scale,
-        )
-        save_video_outputs(direct_hr_outputs, save_path, tag=f"direct_hr_{run_tag}")
 
 
 if __name__ == "__main__":

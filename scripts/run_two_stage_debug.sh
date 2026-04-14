@@ -1,9 +1,4 @@
 #!/bin/bash
-# Description: Image-space two-stage debug baseline with latent dumps and optional direct-HR comparison.
+# Description: Legacy alias for latent inspection mode.
 
-bash scripts/run_two_stage.sh \
-    --debug-latent-dir ./capture_latents \
-    --log-latent-stats \
-    --match-init-stats \
-    --run-direct-hr \
-    "$@"
+bash scripts/run_two_stage_inspect.sh "$@"
